@@ -71,3 +71,32 @@ Si vous utilisez ce dépôt dans un travail ou une publication, merci de citer: 
 
 ## Contact
 Pour toute question ou suggestion, ouvrez une issue sur le dépôt ou proposez une *pull request*.
+
+## PostGIS avec Docker Compose (optionnel)
+
+Pour accélérer les analyses spatiales, vous pouvez charger les GeoPackages RPG dans une base PostGIS dockerisée.
+
+### Démarrage
+```bash
+docker compose up -d postgis
+```
+
+### Chargement automatique des GPKG
+Placez vos fichiers `PARCELLES_GRAPHIQUES_*.gpkg` dans `data/` (déjà présent pour 2023 et 2024), puis lancez le service de chargement:
+```bash
+docker compose up loader
+```
+Le script `docker/scripts/load_rpg.sh` importe chaque couche avec GDAL/OGR (`ogr2ogr`) vers le schéma `rpg` de la base `rpg`. Les tables sont suffixées par l'année détectée (ex: `parcelles_graphiques_2023`).
+
+### Connexion
+```bash
+PGPASSWORD=rpg psql -h localhost -p 5432 -U rpg -d rpg
+```
+
+Paramètres par défaut:
+- Base: `rpg`
+- Utilisateur: `rpg`
+- Mot de passe: `rpg`
+- Schéma: `rpg`
+
+Extensions et schéma sont initialisés via `docker/initdb/01_init.sql`.
