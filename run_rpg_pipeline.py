@@ -4,7 +4,7 @@ import geopandas as gpd
 import pandas as pd
 
 from rpg_geospatial_utils import (
-	rasterize_two_geojsons_same_grid_streaming,
+	rasterize_two_geojsons_tiled,
 	compute_transition_matrix_from_rasters,
 )
 
@@ -31,7 +31,7 @@ def main() -> None:
 
 	# 1) Rasterize both years on the same grid and save mapping (streaming)
 
-	rasterize_two_geojsons_same_grid_streaming(
+	rasterize_two_geojsons_tiled(
 		geojson_2023=args.geojson_2023,
 		geojson_2024=args.geojson_2024,
 		output_tiff_2023=raster_2023,
