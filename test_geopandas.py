@@ -7,7 +7,7 @@ Load both 2023 and 2024 GPKG files, merge by ID_PARCEL, and split into:
 
 import sys
 from pathlib import Path
-
+import time
 try:
     import geopandas as gpd
     import pandas as pd
@@ -36,7 +36,7 @@ def prepare_data() -> None:
     print(f"Reading 2024 data: {gpkg_2024_path}")
     gdf_2024 = gpd.read_file(str(gpkg_2024_path))
     print(f"2024 - Rows: {len(gdf_2024)}, Columns: {list(gdf_2024.columns)}")
-    
+
     # Check for required columns
     required_cols = ['ID_PARCEL', 'SURF_PARC']
     for col in required_cols:
@@ -49,11 +49,23 @@ def prepare_data() -> None:
     gdf_2023['SURF_PARC'] = pd.to_numeric(gdf_2023['SURF_PARC'], errors='coerce')
     gdf_2024['SURF_PARC'] = pd.to_numeric(gdf_2024['SURF_PARC'], errors='coerce')
     
-    # Merge by ID_PARCEL
+    # Merge by ID_PARCEL - include all properties from both datasets
     print("Merging datasets by ID_PARCEL...")
+    
+    # Prepare 2023 data with year suffix
+    gdf_2023_renamed = gdf_2023.copy()
+    gdf_2023_renamed = gdf_2023_renamed.drop(columns=['geometry'])
+    gdf_2023_renamed.columns = [f"{col}_2023" if col != 'ID_PARCEL' else col for col in gdf_2023_renamed.columns]
+
+    # Prepare 2024 data with year suffix  
+    gdf_2024_renamed = gdf_2024.copy()
+    gdf_2024_renamed = gdf_2024_renamed.drop(columns=['geometry'])
+    gdf_2024_renamed.columns = [f"{col}_2024" if col != 'ID_PARCEL' else col for col in gdf_2024_renamed.columns]
+    
+    # Merge all properties
     merged = pd.merge(
-        gdf_2023[['ID_PARCEL', 'SURF_PARC']].rename(columns={'SURF_PARC': 'SURF_PARC_2023'}),
-        gdf_2024[['ID_PARCEL', 'SURF_PARC']].rename(columns={'SURF_PARC': 'SURF_PARC_2024'}),
+        gdf_2023_renamed,
+        gdf_2024_renamed,
         on='ID_PARCEL',
         how='inner'
     )
@@ -100,7 +112,7 @@ def prepare_data() -> None:
     print(f"2024 filtered parcels: {len(gdf_2024_filtered)}")
 
 
-def load_data() -> None:
+def load_initial_data() -> None:
     print(f"Loading data from {data_dir}")
     matching_parcels = pd.read_csv(data_dir / "matching_parcels_2023_2024.csv")
     gdf_2023_filtered = gpd.read_parquet(data_dir / "parcels_2023_filtered.parquet")
@@ -112,23 +124,99 @@ def load_data() -> None:
     return matching_parcels, gdf_2023_filtered, gdf_2024_filtered
 
 def analyse_geospatial_data(gdf_2023_filtered: gpd.GeoDataFrame, gdf_2024_filtered: gpd.GeoDataFrame) -> None:
-    # Load data and run a spatial outer join on the two dataframes
-    merged = gpd.sjoin(gdf_2023_filtered, gdf_2024_filtered, how="inner", predicate="intersects")
-    print(f"Merged data: {len(merged)}")
-    print(f"Merged data columns: {list(merged.columns)}")
-    print(f"Merged data geometry: {merged.geometry.head()}")
-    print(f"Merged data columns: {list(merged.columns)}")
+    # Use geopandas overlay to find intersections
+    print("Calculating intersections using geopandas.overlay...")
+    start_time = time.time()
+    intersections = gpd.overlay(gdf_2023_filtered, gdf_2024_filtered, how='intersection')
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time:.2f} seconds")
+    print(f"Found {len(intersections)} intersection polygons")
     
-    # Calculate intersection area between 2023 and 2024 geometries
-    merged['intersection_area'] = merged.geometry.intersection(merged.geometry_right).area
-    print(f"Intersection areas calculated. Sample: {merged['intersection_area'].head()}")
+    # Rename columns to have meaningful suffixes
+    column_mapping = {}
+    for col in intersections.columns:
+        if col.endswith('_1'):
+            column_mapping[col] = col.replace('_1', '_2023')
+        elif col.endswith('_2'):
+            column_mapping[col] = col.replace('_2', '_2024')
+    intersections = intersections.rename(columns=column_mapping)
+    print(f"Column names: {list(intersections.columns)}")
+    
+    # Calculate intersection areas in hectares
+    intersections['intersection_area'] = intersections.geometry.area/10000
+    print(f"Intersection areas calculated. Sample: {intersections[['ID_PARCEL_2023', 'intersection_area']].head()}")
+    print(f"Total intersection area: {intersections['intersection_area'].sum():.2f} ha")
 
-    # Save merged data to parquet
-    merged.to_parquet(data_dir / "merged_parcels.parquet")
-    print(f"Saved merged data: {data_dir / 'merged_parcels.parquet'}")
+    # Save intersection data to parquet
+    intersections.to_parquet(data_dir / "intersection_parcels.parquet")
+    print(f"Saved intersection data: {data_dir / 'intersection_parcels.parquet'}")
+    
+    # drop geometry column and print head
+    intersections = intersections.drop(columns=['geometry'])
+    print(f"Intersection data: {intersections.head()}")
+    print(f"Loaded {len(intersections)} intersection polygons")
+    # Save as CSV
+    intersections.to_csv(data_dir / "intersection_parcels.csv", index=False)
+    print(f"Saved intersection data: {data_dir / 'intersection_parcels.csv'}")
+    return intersections
+
+def combine_data(matching_parcels: pd.DataFrame, intersected_parcels: pd.DataFrame) -> None:
+    """Reformat and append the two dataframes keeping all columns and renaming area columns"""
+    
+    # Reformat matching_parcels - keep all columns, rename SURF_PARC_2023 to AREA
+    matching_formatted = matching_parcels.copy()
+    matching_formatted['ID_PARCEL_2023'] = matching_formatted['ID_PARCEL']
+    matching_formatted['ID_PARCEL_2024'] = matching_formatted['ID_PARCEL']
+    matching_formatted = matching_formatted.rename(columns={'SURF_PARC_2023': 'AREA'})
+    matching_formatted['TYPE'] = 'MATCHING'
+    
+    # Reformat intersected_parcels - keep all columns, rename intersection_area to AREA
+    intersected_formatted = intersected_parcels.copy()
+    intersected_formatted = intersected_formatted.rename(columns={'intersection_area': 'AREA'})
+    intersected_formatted['TYPE'] = 'INTERSECTED'
+    
+    # Combine the two dataframes
+    combined = pd.concat([matching_formatted, intersected_formatted], ignore_index=True)
+    
+    print(f"Combined data: {combined.head()}")
+    print(f"Loaded {len(combined)} combined parcels")
+    print(f"Matching parcels: {len(matching_formatted)}")
+    print(f"Intersected parcels: {len(intersected_formatted)}")
+    
+    # Save as CSV
+    combined.to_csv(data_dir / "combined_parcels.csv", index=False)
+    print(f"Saved combined data: {data_dir / 'combined_parcels.csv'}")
+
+def calculate_transition_matrix(combined_parcels: pd.DataFrame) -> None:
+    """Calculate the transition matrix by culture"""
+    # First aggregate areas by CODE_CULTU combinations to handle duplicates
+    aggregated = combined_parcels.groupby(['CODE_CULTU_2023', 'CODE_CULTU_2024'])['AREA'].sum().reset_index()
+    print(f"Aggregated data: {len(aggregated)} unique culture transitions")
+    
+    # Now create the pivot table
+    transition_matrix = aggregated.pivot(index='CODE_CULTU_2023', columns='CODE_CULTU_2024', values='AREA')
+    
+    # Fill NaN values with 0 (no transition)
+    transition_matrix = transition_matrix.fillna(0)
+    # Only keep 2 digits after the decimal point
+    transition_matrix = transition_matrix.round(2)
+    
+    print(f"Transition matrix shape: {transition_matrix.shape}")
+    print(f"Transition matrix:\n{transition_matrix}")
+    
+    # Save as CSV
+    transition_matrix.to_csv(data_dir / "transition_matrix.csv")
+    print(f"Saved transition matrix: {data_dir / 'transition_matrix.csv'}")
+    return transition_matrix
 
 if __name__ == "__main__":
     # prepare_data()
-    matching_parcels, gdf_2023_filtered, gdf_2024_filtered = load_data()
-    analyse_geospatial_data(gdf_2023_filtered, gdf_2024_filtered)
-
+    # matching_parcels, gdf_2023_filtered, gdf_2024_filtered = load_initial_data()
+    # intersected_parcels = analyse_geospatial_data(gdf_2023_filtered, gdf_2024_filtered)
+    
+    # matching_parcels = pd.read_csv(data_dir / "matching_parcels_2023_2024.csv")
+    # intersected_parcels = pd.read_csv(data_dir / "intersection_parcels.csv")
+    
+    # combine_data(matching_parcels, intersected_parcels)
+    combined_parcels = pd.read_csv(data_dir / "combined_parcels.csv")
+    transition_matrix = calculate_transition_matrix(combined_parcels)
