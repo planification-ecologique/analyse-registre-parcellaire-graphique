@@ -4,7 +4,7 @@ import geopandas as gpd
 import pandas as pd
 
 from rpg_geospatial_utils import (
-	rasterize_two_geojsons_same_grid,
+	rasterize_two_geojsons_same_grid_streaming,
 	compute_transition_matrix_from_rasters,
 )
 
@@ -29,8 +29,8 @@ def main() -> None:
 	mapping_csv = os.path.join(args.out_dir, f"mapping_{args.attr}.csv")
 	matrix_csv = os.path.join(args.out_dir, "transition_matrix_ha_2023_2024.csv")
 
-	# 1) Rasterize both years on the same grid and save mapping
-	rasterize_two_geojsons_same_grid(
+	# 1) Rasterize both years on the same grid and save mapping (streaming)
+	rasterize_two_geojsons_same_grid_streaming(
 		geojson_2023=args.geojson_2023,
 		geojson_2024=args.geojson_2024,
 		output_tiff_2023=raster_2023,
@@ -56,23 +56,31 @@ def main() -> None:
 	print(f"Saved transition matrix (ha): {matrix_csv}")
 	print(f"Matrix shape: {matrix.shape[0]} x {matrix.shape[1]}")
 
-	# 3) Validation: compare SURF_PARC total (year 1) vs total hectares in matrix
+	# 3) Validation: compare SURF_PARC total (year 1) vs total hectares in matrix (streamed)
 	try:
-		gdf_2023 = gpd.read_file(args.geojson_2023)
-		# Find SURF_PARC column case-insensitively
-		lower_cols = {c.lower(): c for c in gdf_2023.columns}
-		if "surf_parc" not in lower_cols:
-			raise KeyError(
-				"Column 'SURF_PARC' not found in 2023 GeoJSON. Available columns: "
-				+ ", ".join(gdf_2023.columns)
-			)
-		surf_col = lower_cols["surf_parc"]
-		# Coerce to numeric and sum (assumed hectares)
-		surf_parc_total_2023 = gdf_2023[surf_col].apply(pd.to_numeric, errors="coerce").fillna(0).sum()
+		import fiona
+		total = 0.0
+		with fiona.open(args.geojson_2023, "r") as src:
+			# find SURF_PARC column case-insensitively from schema
+			schema_props = src.schema.get("properties", {})
+			name_map = {str(k).lower(): k for k in schema_props.keys()}
+			if "surf_parc" not in name_map:
+				raise KeyError(
+					"Column 'SURF_PARC' not found in 2023 GeoJSON. Available columns: "
+					+ ", ".join(schema_props.keys())
+				)
+			surf_key = name_map["surf_parc"]
+			for feat in src:
+				val = feat.get("properties", {}).get(surf_key)
+				try:
+					v = float(val) if val is not None else 0.0
+				except Exception:
+					v = 0.0
+				total += v
 		matrix_total_hectares = float(matrix.values.sum())
-		gap = matrix_total_hectares - surf_parc_total_2023
+		gap = matrix_total_hectares - total
 		print(
-			f"Validation — SURF_PARC total 2023: {surf_parc_total_2023:,.2f} ha | "
+			f"Validation — SURF_PARC total 2023: {total:,.2f} ha | "
 			f"Matrix total: {matrix_total_hectares:,.2f} ha | Diff (matrix - SURF_PARC): {gap:,.2f} ha"
 		)
 		if abs(gap) > 1e-3:

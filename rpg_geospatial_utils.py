@@ -11,7 +11,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import box
 from shapely.ops import transform as shapely_transform
 from pyproj import Transformer
-import fiona
+import json
 
 
 def _iter_with_progress(iterable: Iterable, total: Optional[int] = None, desc: Optional[str] = None) -> Iterable:
@@ -43,6 +43,16 @@ def _grid_from_bounds(bounds: Tuple[float, float, float, float], resolution_m: f
 	aligned_maxy = miny + height * resolution_m
 	transform = from_origin(minx, aligned_maxy, resolution_m, resolution_m)
 	return transform, height, width
+
+
+def count_features(file_path: str) -> int:
+	"""Count the number of line-delimited GeoJSON Feature lines in a file."""
+	count = 0
+	with open(file_path, "r") as f:
+		for line in f:
+			if line.strip().startswith('{ "type": "Feature"'):
+				count += 1
+	return count
 
 
 def rasterize_geojson_cod_cult(
@@ -292,14 +302,6 @@ def export_transition_matrix_csv(matrix: pd.DataFrame, output_csv: str) -> None:
 	matrix.to_csv(output_csv, float_format="%.4f")
 
 
-__all__ = [
-	"rasterize_geojson_cod_cult",
-	"rasterize_two_geojsons_same_grid",
-	"compute_transition_matrix_from_rasters",
-	"export_transition_matrix_csv",
-]
-
-
 def rasterize_geojson_cod_cult_streaming(
 	input_geojson: str,
 	output_tiff: str,
@@ -311,66 +313,114 @@ def rasterize_geojson_cod_cult_streaming(
 	batch_size: int = 500,
 ) -> Dict[str, int]:
 	"""
-	Rasterize a potentially very large GeoJSON by streaming features with Fiona.
+	Rasterize a potentially very large GeoJSON by streaming features line-by-line.
 
-	- Reprojects geometries to EPSG:2154 on the fly.
+	- Assumes GeoJSON coordinates are in EPSG:4326; reprojects to EPSG:2154 on the fly.
 	- Uses a batching strategy to avoid holding all shapes in memory.
 	- If no mapping provided, builds it in a first streaming pass.
 	"""
-	# Open source and get bounds/crs cheaply
-	with fiona.open(input_geojson, "r") as src:
-		src_crs = src.crs_wkt or src.crs
-		minx, miny, maxx, maxy = src.bounds
+	print(f"[streaming-single] Start — input: {input_geojson}")
+	# Prepare transformer (assuming input GeoJSON is EPSG:4326)
+	transformer = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
-	# Prepare transformer to EPSG:2154
-	transformer = Transformer.from_crs(src_crs, "EPSG:2154", always_xy=True)
-
-	# Transform bounds to EPSG:2154 for grid creation
-	minx2154, miny2154 = transformer.transform(minx, miny)
-	maxx2154, maxy2154 = transformer.transform(maxx, maxy)
-	transform, height, width = _grid_from_bounds((minx2154, miny2154, maxx2154, maxy2154), resolution_m)
-
-	# First pass to build mapping if needed
-	if code_mapping is None:
-		unique_vals: set[str] = set()
-		with fiona.open(input_geojson, "r") as src:
-			for feat in _iter_with_progress(src, total=None, desc="Scanning codes"):
-				val = str(feat.get("properties", {}).get(attr_name, ""))
+	print("[streaming-single] First pass — scanning bounds and codes...")
+	minx2154 = float("inf"); miny2154 = float("inf"); maxx2154 = float("-inf"); maxy2154 = float("-inf")
+	unique_vals: set[str] = set()
+	feature_count = 0
+	with open(input_geojson, "r") as f:
+		try:
+			from tqdm import tqdm  # type: ignore
+			total_first_pass = count_features(input_geojson)
+			it = tqdm(f, total=total_first_pass if total_first_pass > 0 else None, desc="Scanning features (pass 1)")
+		except Exception:
+			it = f
+		for line in it:
+			line = line.strip()
+			if not line.startswith('{ "type": "Feature"'):
+				continue
+			try:
+				feat = json.loads(line.rstrip(','))
+			except Exception:
+				continue
+			feature_count += 1
+			props = feat.get("properties", {})
+			if code_mapping is None:
+				val = str(props.get(attr_name, ""))
 				if val:
 					unique_vals.add(val)
+			# geometry bounds in 2154
+			try:
+				from shapely.geometry import shape
+				geom = shape(feat.get("geometry")) if feat.get("geometry") else None
+				if geom is None:
+					continue
+				geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
+				gxmin, gymin, gxmax, gymax = geom_2154.bounds
+				minx2154 = min(minx2154, gxmin); miny2154 = min(miny2154, gymin)
+				maxx2154 = max(maxx2154, gxmax); maxy2154 = max(maxy2154, gymax)
+			except Exception:
+				continue
+
+	if code_mapping is None:
 		code_mapping = {val: idx + 1 for idx, val in enumerate(sorted(unique_vals))}
 
-	# Rasterize in batches, writing to array
+	print("[streaming-single] Building grid...")
+	transform, height, width = _grid_from_bounds((minx2154, miny2154, maxx2154, maxy2154), resolution_m)
+
+	print("[streaming-single] Second pass — rasterizing features...")
 	arr = np.full((height, width), nodata, dtype=np.uint32)
-
-	def _reproject_geom(geom: dict) -> object:
-		from shapely.geometry import shape
-		shp = shape(geom)
-		return shapely_transform(lambda x, y: transformer.transform(x, y), shp)
-
 	batch: list[tuple] = []
-	with fiona.open(input_geojson, "r") as src:
-		it = _iter_with_progress(src, total=None, desc="Rasterizing")
-		for feat in it:
+	try:
+		from tqdm import tqdm  # type: ignore
+		progress_iter = tqdm(desc="Rasterizing", total=feature_count if feature_count > 0 else None)
+		use_tqdm = True
+	except Exception:
+		progress_iter = None
+		use_tqdm = False
+
+	with open(input_geojson, "r") as f:
+		for line in f:
+			line = line.strip()
+			if not line.startswith('{ "type": "Feature"'):
+				continue
+			try:
+				feat = json.loads(line.rstrip(','))
+			except Exception:
+				if use_tqdm:
+					progress_iter.update(1)
+				continue
 			props = feat.get("properties", {})
 			val = str(props.get(attr_name, ""))
 			code = code_mapping.get(val, nodata)
-			geom_proj = _reproject_geom(feat["geometry"]) if feat.get("geometry") else None
-			if geom_proj is None:
+			try:
+				from shapely.geometry import shape
+				geom = shape(feat.get("geometry")) if feat.get("geometry") else None
+				if geom is None:
+					if use_tqdm:
+						progress_iter.update(1)
+					continue
+				geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
+			except Exception:
+				if use_tqdm:
+					progress_iter.update(1)
 				continue
-			batch.append((geom_proj, code))
+			batch.append((geom_2154, code))
 			if len(batch) >= batch_size:
 				burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
 				mask = burn != nodata
 				arr[mask] = burn[mask]
 				batch.clear()
+			if use_tqdm:
+				progress_iter.update(1)
 		# flush remaining
 		if batch:
 			burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
 			mask = burn != nodata
 			arr[mask] = burn[mask]
+	if use_tqdm:
+		progress_iter.close()
 
-	# Write GeoTIFF
+	print(f"[streaming-single] Writing GeoTIFF → {output_tiff}")
 	os.makedirs(os.path.dirname(output_tiff) or ".", exist_ok=True)
 	with rasterio.open(
 		output_tiff,
@@ -390,7 +440,190 @@ def rasterize_geojson_cod_cult_streaming(
 
 	# Optionally save mapping
 	if return_mapping_csv:
+		print(f"[streaming-single] Saving mapping CSV → {return_mapping_csv}")
 		pd.DataFrame({attr_name: list(code_mapping.keys()), "code": list(code_mapping.values())}) \
 			.sort_values("code").to_csv(return_mapping_csv, index=False)
 
+	print("[streaming-single] Done.")
 	return code_mapping
+
+
+def rasterize_two_geojsons_same_grid_streaming(
+	geojson_2023: str,
+	geojson_2024: str,
+	output_tiff_2023: str,
+	output_tiff_2024: str,
+	resolution_m: float = 10.0,
+	attr_name: str = "CODE_CULTU",
+	nodata: int = 0,
+	return_mapping_csv: Optional[str] = None,
+	batch_size: int = 500,
+) -> Dict[str, int]:
+	"""
+	Rasterize two potentially large GeoJSONs onto the same grid by streaming line-by-line.
+
+	- Assumes GeoJSON coordinates are in EPSG:4326 and reprojects to EPSG:2154.
+	- Computes a shared grid in EPSG:2154 by unioning transformed bounds.
+	- Builds a shared code mapping across both years via streaming first pass.
+	- Streams features in batches for each year and rasterizes incrementally.
+	"""
+	print(f"[streaming-two] Start — inputs: {geojson_2023}, {geojson_2024}")
+	# Prepare transformer (assuming inputs are EPSG:4326)
+	transformer = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
+
+	print("[streaming-two] First pass — scanning union bounds and codes...")
+	minx = float("inf"); miny = float("inf"); maxx = float("-inf"); maxy = float("-inf")
+	unique_vals: set[str] = set()
+	feature_counts: Dict[str, int] = {}
+	for path in (geojson_2023, geojson_2024):
+		with open(path, "r") as f:
+			try:
+				from tqdm import tqdm  # type: ignore
+				total_first_pass = count_features(path)
+				it = tqdm(f, total=total_first_pass if total_first_pass > 0 else None, desc=f"Scanning features (pass 1) — {os.path.basename(path)}")
+			except Exception:
+				it = f
+			for line in it:
+				line = line.strip()
+				if not line.startswith('{ "type": "Feature"'):
+					continue
+				try:
+					feat = json.loads(line.rstrip(','))
+				except Exception:
+					continue
+				feature_counts[path] = feature_counts.get(path, 0) + 1
+				props = feat.get("properties", {})
+				val = str(props.get(attr_name, ""))
+				if val:
+					unique_vals.add(val)
+				try:
+					from shapely.geometry import shape
+					geom = shape(feat.get("geometry")) if feat.get("geometry") else None
+					if geom is None:
+						continue
+					geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
+					gxmin, gymin, gxmax, gymax = geom_2154.bounds
+					minx = min(minx, gxmin); miny = min(miny, gymin)
+					maxx = max(maxx, gxmax); maxy = max(maxy, gymax)
+				except Exception:
+					continue
+	code_mapping: Dict[str, int] = {val: idx + 1 for idx, val in enumerate(sorted(unique_vals))}
+
+	print("[streaming-two] Building shared grid...")
+	transform, height, width = _grid_from_bounds((minx, miny, maxx, maxy), resolution_m)
+
+	# Helper to iterate and rasterize one file
+	def rasterize_one(path: str) -> np.ndarray:
+		arr = np.full((height, width), nodata, dtype=np.uint32)
+		batch: list[tuple] = []
+		try:
+			from tqdm import tqdm  # type: ignore
+			total = feature_counts.get(path)
+			pbar = tqdm(desc=f"Rasterizing {os.path.basename(path)}", total=total if total and total > 0 else None)
+			use_tqdm = True
+		except Exception:
+			pbar = None
+			use_tqdm = False
+		with open(path, "r") as f:
+			for line in f:
+				line = line.strip()
+				if not line.startswith('{ "type": "Feature"'):
+					continue
+				try:
+					feat = json.loads(line.rstrip(','))
+				except Exception:
+					if use_tqdm:
+						pbar.update(1)
+					continue
+				props = feat.get("properties", {})
+				val = str(props.get(attr_name, ""))
+				code = code_mapping.get(val, nodata)
+				try:
+					from shapely.geometry import shape
+					geom = shape(feat.get("geometry")) if feat.get("geometry") else None
+					if geom is None:
+						if use_tqdm:
+							pbar.update(1)
+						continue
+					geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
+				except Exception:
+					if use_tqdm:
+						pbar.update(1)
+					continue
+				batch.append((geom_2154, code))
+				if len(batch) >= batch_size:
+					burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
+					mask = burn != nodata
+					arr[mask] = burn[mask]
+					batch.clear()
+				if use_tqdm:
+					pbar.update(1)
+			# flush remaining
+			if batch:
+				burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
+				mask = burn != nodata
+				arr[mask] = burn[mask]
+		if use_tqdm:
+			pbar.close()
+		return arr
+
+	print("[streaming-two] Rasterizing year 2023...")
+	arr23 = rasterize_one(geojson_2023)
+	print("[streaming-two] Rasterizing year 2024...")
+	arr24 = rasterize_one(geojson_2024)
+
+	# Write rasters
+	print(f"[streaming-two] Writing GeoTIFF 2023 → {output_tiff_2023}")
+	os.makedirs(os.path.dirname(output_tiff_2023) or ".", exist_ok=True)
+	with rasterio.open(
+		output_tiff_2023,
+		"w",
+		driver="GTiff",
+		height=height,
+		width=width,
+		count=1,
+		dtype=arr23.dtype,
+		crs="EPSG:2154",
+		transform=transform,
+		nodata=nodata,
+		compress="deflate",
+		predictor=2,
+	) as dst:
+		dst.write(arr23, 1)
+
+	print(f"[streaming-two] Writing GeoTIFF 2024 → {output_tiff_2024}")
+	os.makedirs(os.path.dirname(output_tiff_2024) or ".", exist_ok=True)
+	with rasterio.open(
+		output_tiff_2024,
+		"w",
+		driver="GTiff",
+		height=height,
+		width=width,
+		count=1,
+		dtype=arr24.dtype,
+		crs="EPSG:2154",
+		transform=transform,
+		nodata=nodata,
+		compress="deflate",
+		predictor=2,
+	) as dst:
+		dst.write(arr24, 1)
+
+	# Optionally save mapping
+	if return_mapping_csv:
+		print(f"[streaming-two] Saving mapping CSV → {return_mapping_csv}")
+		pd.DataFrame({attr_name: list(code_mapping.keys()), "code": list(code_mapping.values())}) \
+			.sort_values("code").to_csv(return_mapping_csv, index=False)
+
+	print("[streaming-two] Done.")
+	return code_mapping
+
+
+__all__ = [
+	"rasterize_geojson_cod_cult",
+	"rasterize_two_geojsons_same_grid",
+	"rasterize_geojson_cod_cult_streaming",
+	"rasterize_two_geojsons_same_grid_streaming",
+	"compute_transition_matrix_from_rasters",
+	"export_transition_matrix_csv",
+]
