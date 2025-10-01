@@ -14,6 +14,18 @@ from pyproj import Transformer
 import json
 
 
+
+# Approximate EPSG:2154 bounds for hexagonal France (Lambert-93)
+FR_HEX_BOUNDS_2154: Tuple[float, float, float, float] = (0.0, 6000000.0, 1200000.0, 7200000.0)
+
+# Use fixed mapping if available and hexagonal France bounds to skip scanning
+fixed_mapping_csv = os.path.join(os.path.dirname(__file__), "data", "code_cultu_map.csv")
+df_map = pd.read_csv(fixed_mapping_csv, sep=';')
+code_mapping = {row['code_culture']: idx + 1 for idx, row in df_map.iterrows()}
+code_mapping['NO CULTURE'] = 0
+
+print(f"Loaded {len(code_mapping)} culture codes from {fixed_mapping_csv}")
+
 def _iter_with_progress(iterable: Iterable, total: Optional[int] = None, desc: Optional[str] = None) -> Iterable:
 	"""Yield items from iterable while displaying a progress bar if tqdm is available."""
 	try:
@@ -45,6 +57,7 @@ def _grid_from_bounds(bounds: Tuple[float, float, float, float], resolution_m: f
 	return transform, height, width
 
 
+
 def count_features(file_path: str) -> int:
 	"""Count the number of line-delimited GeoJSON Feature lines in a file."""
 	count = 0
@@ -61,7 +74,6 @@ def rasterize_geojson_cod_cult(
 	resolution_m: float = 10.0,
 	attr_name: str = "CODE_CULTU",
 	nodata: int = 0,
-	code_mapping: Optional[Dict[str, int]] = None,
 	return_mapping_csv: Optional[str] = None,
 ) -> Dict[str, int]:
 	"""
@@ -78,7 +90,6 @@ def rasterize_geojson_cod_cult(
 		resolution_m: Pixel size in meters.
 		attr_name: Attribute containing the culture code.
 		nodata: NODATA integer value.
-		code_mapping: Optional pre-defined mapping from raw values to int codes.
 		return_mapping_csv: Optional CSV path to save mapping table.
 
 	Returns:
@@ -94,10 +105,6 @@ def rasterize_geojson_cod_cult(
 
 	# Prepare value mapping (ensure integers for raster encoding)
 	values = gdf[attr_name].astype(str).fillna("")
-	if code_mapping is None:
-		unique_vals = sorted(set(values) - {""})
-		# start at 1 to keep 0 as nodata
-		code_mapping = {val: idx + 1 for idx, val in enumerate(unique_vals)}
 
 	# Wrap feature iteration with progress
 	shapes: Iterable = (
@@ -170,7 +177,6 @@ def rasterize_two_geojsons_same_grid(
 	# Build shared mapping across both years
 	vals = pd.concat([gdf23[attr_name].astype(str), gdf24[attr_name].astype(str)], ignore_index=True).fillna("")
 	unique_vals = sorted(set(vals) - {""})
-	code_mapping = {val: idx + 1 for idx, val in enumerate(unique_vals)}
 
 	def _rasterize(gdf: gpd.GeoDataFrame, out_path: str):
 		shapes = (
@@ -218,7 +224,6 @@ def compute_transition_matrix_from_rasters(
 	raster_2024_path: str,
 	output_csv: Optional[str] = None,
 	attr_name: str = "CODE_CULTU",
-	code_mapping_csv: Optional[str] = None,
 ) -> pd.DataFrame:
 	"""
 	Compute the evolution matrix (hectares) between two aligned rasters of CODE_CULTU.
@@ -272,11 +277,6 @@ def compute_transition_matrix_from_rasters(
 
 	# Replace integer codes with labels; map 0 to "NO CULTURE"
 	label_by_code: Dict[int, str] = {}
-	if code_mapping_csv and os.path.exists(code_mapping_csv):
-		mapping_df = pd.read_csv(code_mapping_csv)
-		if {attr_name, "code"}.issubset(mapping_df.columns):
-			label_by_code = mapping_df.set_index("code")[attr_name].to_dict()
-
 	def _label_for(code: int):
 		try:
 			code_int = int(code)
@@ -308,9 +308,9 @@ def rasterize_geojson_cod_cult_streaming(
 	resolution_m: float = 10.0,
 	attr_name: str = "CODE_CULTU",
 	nodata: int = 0,
-	code_mapping: Optional[Dict[str, int]] = None,
 	return_mapping_csv: Optional[str] = None,
 	batch_size: int = 500,
+	code_mapping_csv: Optional[str] = None,
 ) -> Dict[str, int]:
 	"""
 	Rasterize a potentially very large GeoJSON by streaming features line-by-line.
@@ -323,43 +323,23 @@ def rasterize_geojson_cod_cult_streaming(
 	# Prepare transformer (assuming input GeoJSON is EPSG:4326)
 	transformer = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
+	# Optional: load code mapping from CSV
+	if code_mapping_csv and os.path.exists(code_mapping_csv):
+		try:
+			df_map = pd.read_csv(code_mapping_csv)
+			if {attr_name, "code"}.issubset(df_map.columns):
+				code_mapping = df_map.set_index(attr_name)["code"].astype(int).to_dict()
+				print(f"[streaming-single] Loaded mapping from {code_mapping_csv} ({len(code_mapping)} codes)")
+		except Exception as e:
+			print(f"[streaming-single] Warning: failed to load mapping CSV: {e}")
+
 	print("[streaming-single] First pass — scanning bounds and codes...")
 	minx2154 = float("inf"); miny2154 = float("inf"); maxx2154 = float("-inf"); maxy2154 = float("-inf")
 	unique_vals: set[str] = set()
 	feature_count = 0
-	with open(input_geojson, "r") as f:
-		try:
-			from tqdm import tqdm  # type: ignore
-			total_first_pass = count_features(input_geojson)
-			it = tqdm(f, total=total_first_pass if total_first_pass > 0 else None, desc="Scanning features (pass 1)")
-		except Exception:
-			it = f
-		for line in it:
-			line = line.strip()
-			if not line.startswith('{ "type": "Feature"'):
-				continue
-			try:
-				feat = json.loads(line.rstrip(','))
-			except Exception:
-				continue
-			feature_count += 1
-			props = feat.get("properties", {})
-			if code_mapping is None:
-				val = str(props.get(attr_name, ""))
-				if val:
-					unique_vals.add(val)
-			# geometry bounds in 2154
-			try:
-				from shapely.geometry import shape
-				geom = shape(feat.get("geometry")) if feat.get("geometry") else None
-				if geom is None:
-					continue
-				geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
-				gxmin, gymin, gxmax, gymax = geom_2154.bounds
-				minx2154 = min(minx2154, gxmin); miny2154 = min(miny2154, gymin)
-				maxx2154 = max(maxx2154, gxmax); maxy2154 = max(maxy2154, gymax)
-			except Exception:
-				continue
+	print("[streaming-single] Skipping bounds scan — using hexagonal France bounds (EPSG:2154).")
+	minx2154, miny2154, maxx2154, maxy2154 = FR_HEX_BOUNDS_2154
+	
 
 	if code_mapping is None:
 		code_mapping = {val: idx + 1 for idx, val in enumerate(sorted(unique_vals))}
@@ -372,7 +352,7 @@ def rasterize_geojson_cod_cult_streaming(
 	batch: list[tuple] = []
 	try:
 		from tqdm import tqdm  # type: ignore
-		progress_iter = tqdm(desc="Rasterizing", total=feature_count if feature_count > 0 else None)
+		progress_iter = tqdm(desc="Rasterizing", total=(feature_count if (feature_count > 0 and not use_hex_france_bounds) else None))
 		use_tqdm = True
 	except Exception:
 		progress_iter = None
@@ -471,44 +451,13 @@ def rasterize_two_geojsons_same_grid_streaming(
 	# Prepare transformer (assuming inputs are EPSG:4326)
 	transformer = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
 
+
 	print("[streaming-two] First pass — scanning union bounds and codes...")
 	minx = float("inf"); miny = float("inf"); maxx = float("-inf"); maxy = float("-inf")
 	unique_vals: set[str] = set()
 	feature_counts: Dict[str, int] = {}
-	for path in (geojson_2023, geojson_2024):
-		with open(path, "r") as f:
-			try:
-				from tqdm import tqdm  # type: ignore
-				total_first_pass = count_features(path)
-				it = tqdm(f, total=total_first_pass if total_first_pass > 0 else None, desc=f"Scanning features (pass 1) — {os.path.basename(path)}")
-			except Exception:
-				it = f
-			for line in it:
-				line = line.strip()
-				if not line.startswith('{ "type": "Feature"'):
-					continue
-				try:
-					feat = json.loads(line.rstrip(','))
-				except Exception:
-					continue
-				feature_counts[path] = feature_counts.get(path, 0) + 1
-				props = feat.get("properties", {})
-				val = str(props.get(attr_name, ""))
-				if val:
-					unique_vals.add(val)
-				try:
-					from shapely.geometry import shape
-					geom = shape(feat.get("geometry")) if feat.get("geometry") else None
-					if geom is None:
-						continue
-					geom_2154 = shapely_transform(lambda x, y: transformer.transform(x, y), geom)
-					gxmin, gymin, gxmax, gymax = geom_2154.bounds
-					minx = min(minx, gxmin); miny = min(miny, gymin)
-					maxx = max(maxx, gxmax); maxy = max(maxy, gymax)
-				except Exception:
-					continue
-	code_mapping: Dict[str, int] = {val: idx + 1 for idx, val in enumerate(sorted(unique_vals))}
 
+	minx, miny, maxx, maxy = FR_HEX_BOUNDS_2154
 	print("[streaming-two] Building shared grid...")
 	transform, height, width = _grid_from_bounds((minx, miny, maxx, maxy), resolution_m)
 
@@ -518,7 +467,7 @@ def rasterize_two_geojsons_same_grid_streaming(
 		batch: list[tuple] = []
 		try:
 			from tqdm import tqdm  # type: ignore
-			total = feature_counts.get(path)
+			total = count_features(path)
 			pbar = tqdm(desc=f"Rasterizing {os.path.basename(path)}", total=total if total and total > 0 else None)
 			use_tqdm = True
 		except Exception:

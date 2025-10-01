@@ -30,6 +30,7 @@ def main() -> None:
 	matrix_csv = os.path.join(args.out_dir, "transition_matrix_ha_2023_2024.csv")
 
 	# 1) Rasterize both years on the same grid and save mapping (streaming)
+
 	rasterize_two_geojsons_same_grid_streaming(
 		geojson_2023=args.geojson_2023,
 		geojson_2024=args.geojson_2024,
@@ -47,7 +48,6 @@ def main() -> None:
 		raster_2024_path=raster_2024,
 		output_csv=matrix_csv,
 		attr_name=args.attr,
-		code_mapping_csv=mapping_csv,
 	)
 
 	# Print brief summary
