@@ -213,18 +213,21 @@ def compute_transition_matrix_from_rasters(
 		arr24 = r24.read(1)
 		transform = r23.transform
 
-	# Pixel area (m^2) then to hectares
-	pixel_area_m2 = abs(transform.a) * abs(transform.e)
-	pixel_area_ha = pixel_area_m2 / 10000.0
+		# Pixel area (m^2) then to hectares
+		pixel_area_m2 = abs(transform.a) * abs(transform.e)
+		pixel_area_ha = pixel_area_m2 / 10000.0
 
-	mask = np.ones(arr23.shape, dtype=bool)
-	if nodata23 is not None:
-		mask &= arr23 != nodata23
-	if nodata24 is not None:
-		mask &= arr24 != nodata24
+		# Include pixels where exactly one year has data. Exclude only pixels where both are NODATA.
+		if nodata23 is None and nodata24 is None:
+			mask = np.ones(arr23.shape, dtype=bool)
+		else:
+			cond23 = (arr23 == nodata23) if nodata23 is not None else np.zeros(arr23.shape, dtype=bool)
+			cond24 = (arr24 == nodata24) if nodata24 is not None else np.zeros(arr24.shape, dtype=bool)
+			# keep where not (both nodata)
+			mask = ~(cond23 & cond24)
 
-	vals23 = arr23[mask].astype(np.int64)
-	vals24 = arr24[mask].astype(np.int64)
+		vals23 = arr23[mask].astype(np.int64)
+		vals24 = arr24[mask].astype(np.int64)
 
 	# Build contingency table efficiently
 	pairs = pd.DataFrame({"y2023": vals23, "y2024": vals24})
@@ -234,13 +237,24 @@ def compute_transition_matrix_from_rasters(
 	# Pivot to wide matrix
 	matrix = counts.pivot(index="y2023", columns="y2024", values="hectares").fillna(0.0)
 
-	# Replace integer codes with labels if mapping CSV provided
+	# Replace integer codes with labels; map 0 to "NO CULTURE"
+	label_by_code: Dict[int, str] = {}
 	if code_mapping_csv and os.path.exists(code_mapping_csv):
 		mapping_df = pd.read_csv(code_mapping_csv)
 		if {attr_name, "code"}.issubset(mapping_df.columns):
 			label_by_code = mapping_df.set_index("code")[attr_name].to_dict()
-			matrix.index = [label_by_code.get(int(c), c) for c in matrix.index]
-			matrix.columns = [label_by_code.get(int(c), c) for c in matrix.columns]
+
+	def _label_for(code: int):
+		try:
+			code_int = int(code)
+		except Exception:
+			return code
+		if code_int == 0:
+			return "NO CULTURE"
+		return label_by_code.get(code_int, code)
+
+	matrix.index = [_label_for(c) for c in matrix.index]
+	matrix.columns = [_label_for(c) for c in matrix.columns]
 
 	if output_csv:
 		os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)

@@ -1,5 +1,7 @@
 import argparse
 import os
+import geopandas as gpd
+import pandas as pd
 
 from rpg_geospatial_utils import (
 	rasterize_two_geojsons_same_grid,
@@ -53,6 +55,33 @@ def main() -> None:
 	print(f"Saved mapping: {mapping_csv}")
 	print(f"Saved transition matrix (ha): {matrix_csv}")
 	print(f"Matrix shape: {matrix.shape[0]} x {matrix.shape[1]}")
+
+	# 3) Validation: compare SURF_PARC total (year 1) vs total hectares in matrix
+	try:
+		gdf_2023 = gpd.read_file(args.geojson_2023)
+		# Find SURF_PARC column case-insensitively
+		lower_cols = {c.lower(): c for c in gdf_2023.columns}
+		if "surf_parc" not in lower_cols:
+			raise KeyError(
+				"Column 'SURF_PARC' not found in 2023 GeoJSON. Available columns: "
+				+ ", ".join(gdf_2023.columns)
+			)
+		surf_col = lower_cols["surf_parc"]
+		# Coerce to numeric and sum (assumed hectares)
+		surf_parc_total_2023 = gdf_2023[surf_col].apply(pd.to_numeric, errors="coerce").fillna(0).sum()
+		matrix_total_hectares = float(matrix.values.sum())
+		gap = matrix_total_hectares - surf_parc_total_2023
+		print(
+			f"Validation — SURF_PARC total 2023: {surf_parc_total_2023:,.2f} ha | "
+			f"Matrix total: {matrix_total_hectares:,.2f} ha | Diff (matrix - SURF_PARC): {gap:,.2f} ha"
+		)
+		if abs(gap) > 1e-3:
+			print(
+				"Note: The matrix sums pixels where both years are valid (excludes NODATA in either year). "
+				"Differences can arise if coverage/filters differ between years."
+			)
+	except Exception as e:
+		print(f"Validation step skipped: {e}")
 
 
 if __name__ == "__main__":
