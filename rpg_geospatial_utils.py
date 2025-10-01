@@ -9,6 +9,19 @@ from rasterio import features
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 from shapely.geometry import box
+from shapely.ops import transform as shapely_transform
+from pyproj import Transformer
+import fiona
+
+
+def _iter_with_progress(iterable: Iterable, total: Optional[int] = None, desc: Optional[str] = None) -> Iterable:
+	"""Yield items from iterable while displaying a progress bar if tqdm is available."""
+	try:
+		from tqdm import tqdm  # type: ignore
+		return tqdm(iterable, total=total, desc=desc)
+	except Exception:
+		# Fallback: no progress bar
+		return iterable
 
 
 def _ensure_epsg_2154(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -76,9 +89,14 @@ def rasterize_geojson_cod_cult(
 		# start at 1 to keep 0 as nodata
 		code_mapping = {val: idx + 1 for idx, val in enumerate(unique_vals)}
 
+	# Wrap feature iteration with progress
 	shapes: Iterable = (
 		(geom, code_mapping.get(val_str, nodata))
-		for geom, val_str in zip(gdf.geometry, values.astype(str))
+		for geom, val_str in _iter_with_progress(
+			zip(gdf.geometry, values.astype(str)),
+			total=len(gdf),
+			desc="Rasterizing"
+		)
 	)
 
 	out_shape = (height, width)
@@ -145,7 +163,12 @@ def rasterize_two_geojsons_same_grid(
 	code_mapping = {val: idx + 1 for idx, val in enumerate(unique_vals)}
 
 	def _rasterize(gdf: gpd.GeoDataFrame, out_path: str):
-		shapes = ((geom, code_mapping.get(str(v), nodata)) for geom, v in zip(gdf.geometry, gdf[attr_name]))
+		shapes = (
+			(geom, code_mapping.get(str(v), nodata))
+			for geom, v in _iter_with_progress(
+				zip(gdf.geometry, gdf[attr_name]), total=len(gdf), desc="Rasterizing"
+			)
+		)
 		r = features.rasterize(
 			shapes=shapes,
 			out_shape=(height, width),
@@ -275,3 +298,99 @@ __all__ = [
 	"compute_transition_matrix_from_rasters",
 	"export_transition_matrix_csv",
 ]
+
+
+def rasterize_geojson_cod_cult_streaming(
+	input_geojson: str,
+	output_tiff: str,
+	resolution_m: float = 10.0,
+	attr_name: str = "CODE_CULTU",
+	nodata: int = 0,
+	code_mapping: Optional[Dict[str, int]] = None,
+	return_mapping_csv: Optional[str] = None,
+	batch_size: int = 500,
+) -> Dict[str, int]:
+	"""
+	Rasterize a potentially very large GeoJSON by streaming features with Fiona.
+
+	- Reprojects geometries to EPSG:2154 on the fly.
+	- Uses a batching strategy to avoid holding all shapes in memory.
+	- If no mapping provided, builds it in a first streaming pass.
+	"""
+	# Open source and get bounds/crs cheaply
+	with fiona.open(input_geojson, "r") as src:
+		src_crs = src.crs_wkt or src.crs
+		minx, miny, maxx, maxy = src.bounds
+
+	# Prepare transformer to EPSG:2154
+	transformer = Transformer.from_crs(src_crs, "EPSG:2154", always_xy=True)
+
+	# Transform bounds to EPSG:2154 for grid creation
+	minx2154, miny2154 = transformer.transform(minx, miny)
+	maxx2154, maxy2154 = transformer.transform(maxx, maxy)
+	transform, height, width = _grid_from_bounds((minx2154, miny2154, maxx2154, maxy2154), resolution_m)
+
+	# First pass to build mapping if needed
+	if code_mapping is None:
+		unique_vals: set[str] = set()
+		with fiona.open(input_geojson, "r") as src:
+			for feat in _iter_with_progress(src, total=None, desc="Scanning codes"):
+				val = str(feat.get("properties", {}).get(attr_name, ""))
+				if val:
+					unique_vals.add(val)
+		code_mapping = {val: idx + 1 for idx, val in enumerate(sorted(unique_vals))}
+
+	# Rasterize in batches, writing to array
+	arr = np.full((height, width), nodata, dtype=np.uint32)
+
+	def _reproject_geom(geom: dict) -> object:
+		from shapely.geometry import shape
+		shp = shape(geom)
+		return shapely_transform(lambda x, y: transformer.transform(x, y), shp)
+
+	batch: list[tuple] = []
+	with fiona.open(input_geojson, "r") as src:
+		it = _iter_with_progress(src, total=None, desc="Rasterizing")
+		for feat in it:
+			props = feat.get("properties", {})
+			val = str(props.get(attr_name, ""))
+			code = code_mapping.get(val, nodata)
+			geom_proj = _reproject_geom(feat["geometry"]) if feat.get("geometry") else None
+			if geom_proj is None:
+				continue
+			batch.append((geom_proj, code))
+			if len(batch) >= batch_size:
+				burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
+				mask = burn != nodata
+				arr[mask] = burn[mask]
+				batch.clear()
+		# flush remaining
+		if batch:
+			burn = features.rasterize(batch, out_shape=(height, width), transform=transform, fill=nodata, dtype=arr.dtype)
+			mask = burn != nodata
+			arr[mask] = burn[mask]
+
+	# Write GeoTIFF
+	os.makedirs(os.path.dirname(output_tiff) or ".", exist_ok=True)
+	with rasterio.open(
+		output_tiff,
+		"w",
+		driver="GTiff",
+		height=height,
+		width=width,
+		count=1,
+		dtype=arr.dtype,
+		crs="EPSG:2154",
+		transform=transform,
+		nodata=nodata,
+		compress="deflate",
+		predictor=2,
+	) as dst:
+		dst.write(arr, 1)
+
+	# Optionally save mapping
+	if return_mapping_csv:
+		pd.DataFrame({attr_name: list(code_mapping.keys()), "code": list(code_mapping.values())}) \
+			.sort_values("code").to_csv(return_mapping_csv, index=False)
+
+	return code_mapping
