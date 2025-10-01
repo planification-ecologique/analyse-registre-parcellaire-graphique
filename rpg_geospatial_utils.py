@@ -36,13 +36,13 @@ def rasterize_geojson_cod_cult(
 	input_geojson: str,
 	output_tiff: str,
 	resolution_m: float = 10.0,
-	attr_name: str = "cod_cult",
+	attr_name: str = "CODE_CULTU",
 	nodata: int = 0,
 	code_mapping: Optional[Dict[str, int]] = None,
 	return_mapping_csv: Optional[str] = None,
 ) -> Dict[str, int]:
 	"""
-	Rasterize a GeoJSON of parcels to a GeoTIFF labeled by cod_cult.
+	Rasterize a GeoJSON of parcels to a GeoTIFF labeled by CODE_CULTU.
 
 	- Reprojects to EPSG:2154 (meters).
 	- Builds a grid from data extent with given resolution.
@@ -121,7 +121,7 @@ def rasterize_two_geojsons_same_grid(
 	output_tiff_2023: str,
 	output_tiff_2024: str,
 	resolution_m: float = 10.0,
-	attr_name: str = "cod_cult",
+	attr_name: str = "CODE_CULTU",
 	nodata: int = 0,
 	return_mapping_csv: Optional[str] = None,
 ) -> Dict[str, int]:
@@ -184,11 +184,11 @@ def compute_transition_matrix_from_rasters(
 	raster_2023_path: str,
 	raster_2024_path: str,
 	output_csv: Optional[str] = None,
-	attr_name: str = "cod_cult",
+	attr_name: str = "CODE_CULTU",
 	code_mapping_csv: Optional[str] = None,
 ) -> pd.DataFrame:
 	"""
-	Compute the evolution matrix (hectares) between two aligned rasters of cod_cult.
+	Compute the evolution matrix (hectares) between two aligned rasters of CODE_CULTU.
 
 	- Requires identical shape, transform, and CRS.
 	- NODATA pixels are ignored.
@@ -261,5 +261,3 @@ __all__ = [
 	"compute_transition_matrix_from_rasters",
 	"export_transition_matrix_csv",
 ]
-
-
