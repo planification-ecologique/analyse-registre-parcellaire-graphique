@@ -16,9 +16,10 @@ except ImportError as exc:
         "geopandas is not installed. Install with: pip install geopandas"
     ) from exc
 
+data_dir = Path(__file__).parent / "data"
 
 def prepare_data() -> None:
-    data_dir = Path(__file__).parent / "data"
+    
     gpkg_2023_path = data_dir / "PARCELLES_GRAPHIQUES_2023.gpkg"
     gpkg_2024_path = data_dir / "PARCELLES_GRAPHIQUES_2024.gpkg"
     
@@ -99,6 +100,35 @@ def prepare_data() -> None:
     print(f"2024 filtered parcels: {len(gdf_2024_filtered)}")
 
 
+def load_data() -> None:
+    print(f"Loading data from {data_dir}")
+    matching_parcels = pd.read_csv(data_dir / "matching_parcels_2023_2024.csv")
+    gdf_2023_filtered = gpd.read_parquet(data_dir / "parcels_2023_filtered.parquet")
+    gdf_2024_filtered = gpd.read_parquet(data_dir / "parcels_2024_filtered.parquet")
+
+    print(f"Loaded {len(matching_parcels)} matching parcels")
+    print(f"Loaded {len(gdf_2023_filtered)} 2023 filtered parcels")
+    print(f"Loaded {len(gdf_2024_filtered)} 2024 filtered parcels")
+    return matching_parcels, gdf_2023_filtered, gdf_2024_filtered
+
+def analyse_geospatial_data(gdf_2023_filtered: gpd.GeoDataFrame, gdf_2024_filtered: gpd.GeoDataFrame) -> None:
+    # Load data and run a spatial outer join on the two dataframes
+    merged = gpd.sjoin(gdf_2023_filtered, gdf_2024_filtered, how="inner", predicate="intersects")
+    print(f"Merged data: {len(merged)}")
+    print(f"Merged data columns: {list(merged.columns)}")
+    print(f"Merged data geometry: {merged.geometry.head()}")
+    print(f"Merged data columns: {list(merged.columns)}")
+    
+    # Calculate intersection area between 2023 and 2024 geometries
+    merged['intersection_area'] = merged.geometry.intersection(merged.geometry_right).area
+    print(f"Intersection areas calculated. Sample: {merged['intersection_area'].head()}")
+
+    # Save merged data to parquet
+    merged.to_parquet(data_dir / "merged_parcels.parquet")
+    print(f"Saved merged data: {data_dir / 'merged_parcels.parquet'}")
+
 if __name__ == "__main__":
-    prepare_data()
+    # prepare_data()
+    matching_parcels, gdf_2023_filtered, gdf_2024_filtered = load_data()
+    analyse_geospatial_data(gdf_2023_filtered, gdf_2024_filtered)
 
