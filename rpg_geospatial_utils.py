@@ -463,16 +463,20 @@ def rasterize_two_geojsons_tiled(
 	attr_name: str = "CODE_CULTU",
 	nodata: int = 0,
 	return_mapping_csv: Optional[str] = None,
-	tiles_x: int = 100,
-	tiles_y: int = 100,
+	tiles_x: int = 10,
+	tiles_y: int = 10,
 ) -> Dict[str, int]:
 	"""
-	Rasterize two GeoJSONs using tiled approach to manage memory.
+	Rasterize two GeoJSONs using tiled approach with temporary files.
 	
 	- Uses fixed hexagonal France bounds divided into tiles.
-	- Each tile is processed independently to keep memory low.
-	- Features are streamed and filtered by tile intersection.
+	- Creates temporary tile files, processes features into them.
+	- Combines tiles into final output rasters at the end.
 	"""
+	import tempfile
+	import shutil
+	from pathlib import Path
+	
 	print(f"[tiled] Start — inputs: {geojson_2023}, {geojson_2024}")
 	
 	# Use fixed hexagonal France bounds
@@ -488,61 +492,69 @@ def rasterize_two_geojsons_tiled(
 	tile_height = height // tiles_y
 	print(f"[tiled] Tile size: {tile_width}x{tile_height} pixels ({tiles_x}x{tiles_y} tiles)")
 
-	# Create output rasters
-	os.makedirs(os.path.dirname(output_tiff_2023) or ".", exist_ok=True)
-	os.makedirs(os.path.dirname(output_tiff_2024) or ".", exist_ok=True)
+	# Create temporary directory for tile files
+	temp_dir = Path(tempfile.mkdtemp(prefix="rpg_tiles_"))
+	print(f"[tiled] Using temporary directory: {temp_dir}")
 	
-	# Initialize output rasters
-	with rasterio.open(
-		output_tiff_2023,
-		"w",
-		driver="GTiff",
-		height=height,
-		width=width,
-		count=1,
-		dtype=np.uint32,
-		crs="EPSG:2154",
-		transform=transform,
-		nodata=nodata,
-		compress="deflate",
-		predictor=2,
-	) as dst23, rasterio.open(
-		output_tiff_2024,
-		"w",
-		driver="GTiff",
-		height=height,
-		width=width,
-		count=1,
-		dtype=np.uint32,
-		crs="EPSG:2154",
-		transform=transform,
-		nodata=nodata,
-		compress="deflate",
-		predictor=2,
-	) as dst24:
-		pass  # Files created, will be filled tile by tile
-	
-	# Single-pass per file: precompute tile windows and transforms
-	tile_windows: Dict[tuple[int, int], rasterio.windows.Window] = {}
-	tile_transforms: Dict[tuple[int, int], rasterio.Affine] = {}
-	for ty in range(tiles_y):
-		for tx in range(tiles_x):
-			col_off = tx * tile_width
-			row_off = ty * tile_height
-			col_size = min(tile_width, width - col_off)
-			row_size = min(tile_height, height - row_off)
-			w = rasterio.windows.Window(col_off, row_off, col_size, row_size)
-			tile_windows[(tx, ty)] = w
-			tile_transforms[(tx, ty)] = rasterio.windows.transform(w, transform)
-
-	def _process_one_year(geojson_path: str, out_path: str, desc: str) -> None:
-		try:
-			from tqdm import tqdm  # type: ignore
-			total = count_features(geojson_path)
-			pbar = tqdm(total=total if total and total > 0 else None, desc=desc)
-		except Exception:
-			pbar = None
-		with rasterio.open(out_path, "r+") as dst:
+	try:
+		# Create temporary tile files for each year
+		tile_files_2023 = {}
+		tile_files_2024 = {}
+		
+		for ty in range(tiles_y):
+			for tx in range(tiles_x):
+				col_off = tx * tile_width
+				row_off = ty * tile_height
+				col_size = min(tile_width, width - col_off)
+				row_size = min(tile_height, height - row_off)
+				
+				# Create tile window and transform
+				tile_window = rasterio.windows.Window(col_off, row_off, col_size, row_size)
+				tile_transform = rasterio.windows.transform(tile_window, transform)
+				
+				# Create temporary tile files
+				tile_file_2023 = temp_dir / f"tile_2023_{tx}_{ty}.tif"
+				tile_file_2024 = temp_dir / f"tile_2024_{tx}_{ty}.tif"
+				
+				# Initialize empty tile files
+				with rasterio.open(
+					tile_file_2023, 'w',
+					driver='GTiff',
+					height=row_size,
+					width=col_size,
+					count=1,
+					dtype=np.uint32,
+					crs='EPSG:2154',
+					transform=tile_transform,
+					nodata=nodata,
+				) as dst:
+					dst.write(np.full((row_size, col_size), nodata, dtype=np.uint32), 1)
+				
+				with rasterio.open(
+					tile_file_2024, 'w',
+					driver='GTiff',
+					height=row_size,
+					width=col_size,
+					count=1,
+					dtype=np.uint32,
+					crs='EPSG:2154',
+					transform=tile_transform,
+					nodata=nodata,
+				) as dst:
+					dst.write(np.full((row_size, col_size), nodata, dtype=np.uint32), 1)
+				
+				tile_files_2023[(tx, ty)] = tile_file_2023
+				tile_files_2024[(tx, ty)] = tile_file_2024
+		
+		# Process each year into temporary tiles
+		def _process_one_year(geojson_path: str, tile_files: Dict[tuple[int, int], Path], desc: str) -> None:
+			try:
+				from tqdm import tqdm  # type: ignore
+				total = count_features(geojson_path)
+				pbar = tqdm(total=total if total and total > 0 else None, desc=desc)
+			except Exception:
+				pbar = None
+			
 			with open(geojson_path, "r") as f:
 				for line in f:
 					line = line.strip()
@@ -553,9 +565,11 @@ def rasterize_two_geojsons_tiled(
 					except Exception:
 						if pbar: pbar.update(1)
 						continue
+					
 					props = feat.get("properties", {})
 					val = str(props.get(attr_name, ""))
 					code = code_mapping.get(val, nodata)
+					
 					try:
 						from shapely.geometry import shape
 						geom = shape(feat.get("geometry")) if feat.get("geometry") else None
@@ -566,44 +580,97 @@ def rasterize_two_geojsons_tiled(
 					except Exception:
 						if pbar: pbar.update(1)
 						continue
-					# Convert bounds to pixel rows/cols, clamp to raster extents
+					
+					# Convert bounds to pixel rows/cols
 					try:
 						from rasterio.transform import rowcol
 						c0, r0 = rowcol(transform, gxmin, gymax)
 						c1, r1 = rowcol(transform, gxmax, gymin)
-						col_start = max(0, min(c0, c1)); col_end = min(width - 1, max(c0, c1))
-						row_start = max(0, min(r0, r1)); row_end = min(height - 1, max(r0, r1))
+						col_start = max(0, min(c0, c1))
+						col_end = min(width - 1, max(c0, c1))
+						row_start = max(0, min(r0, r1))
+						row_end = min(height - 1, max(r0, r1))
 					except Exception:
 						if pbar: pbar.update(1)
 						continue
+					
 					# Determine overlapping tile indices
 					tx_start = max(0, col_start // tile_width)
 					tx_end = min(tiles_x - 1, col_end // tile_width)
 					ty_start = max(0, row_start // tile_height)
 					ty_end = min(tiles_y - 1, row_end // tile_height)
+					
+					# Process each overlapping tile
 					for ty in range(ty_start, ty_end + 1):
 						for tx in range(tx_start, tx_end + 1):
-							win = tile_windows[(tx, ty)]
-							local_transform = tile_transforms[(tx, ty)]
-							# Burn feature into tile-sized raster
-							burn = features.rasterize(
-								[(geom, code)],
-								out_shape=(int(win.height), int(win.width)),
-								transform=local_transform,
-								fill=nodata,
-								dtype=np.uint32,
-							)
-							if (burn != nodata).any():
-								existing = dst.read(1, window=win)
+							tile_file = tile_files[(tx, ty)]
+							
+							# Read current tile content
+							with rasterio.open(tile_file, 'r+') as dst:
+								tile_data = dst.read(1)
+								tile_transform = dst.transform
+								
+								# Burn feature into tile
+								burn = features.rasterize(
+									[(geom, code)],
+									out_shape=tile_data.shape,
+									transform=tile_transform,
+									fill=nodata,
+									dtype=np.uint32,
+								)
+								
+								# Update tile where feature was burned
 								mask = burn != nodata
-								existing[mask] = burn[mask]
-								dst.write(existing, 1, window=win)
+								tile_data[mask] = burn[mask]
+								dst.write(tile_data, 1)
+					
 					if pbar: pbar.update(1)
+			
 			if pbar: pbar.close()
-
-	# Process 2023 then 2024 in single pass each
-	_process_one_year(geojson_2023, output_tiff_2023, desc="Rasterizing (tiled) 2023")
-	_process_one_year(geojson_2024, output_tiff_2024, desc="Rasterizing (tiled) 2024")
+		
+		# Process both years
+		_process_one_year(geojson_2023, tile_files_2023, desc="Rasterizing (tiled) 2023")
+		_process_one_year(geojson_2024, tile_files_2024, desc="Rasterizing (tiled) 2024")
+		
+		# Combine tiles into final output rasters
+		print("[tiled] Combining tiles into final rasters...")
+		
+		def _combine_tiles(tile_files: Dict[tuple[int, int], Path], output_path: str, desc: str) -> None:
+			os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+			with rasterio.open(
+				output_path, 'w',
+				driver='GTiff',
+				height=height,
+				width=width,
+				count=1,
+				dtype=np.uint32,
+				crs='EPSG:2154',
+				transform=transform,
+				nodata=nodata,
+				compress="deflate",
+				predictor=2,
+			) as dst:
+				for ty in range(tiles_y):
+					for tx in range(tiles_x):
+						tile_file = tile_files[(tx, ty)]
+						col_off = tx * tile_width
+						row_off = ty * tile_height
+						col_size = min(tile_width, width - col_off)
+						row_size = min(tile_height, height - row_off)
+						
+						with rasterio.open(tile_file, 'r') as src:
+							tile_data = src.read(1)
+							dst.write(tile_data, 1, window=rasterio.windows.Window(col_off, row_off, col_size, row_size))
+		
+		_combine_tiles(tile_files_2023, output_tiff_2023, "Combining 2023 tiles")
+		_combine_tiles(tile_files_2024, output_tiff_2024, "Combining 2024 tiles")
+		
+		print(f"[tiled] Temporary files cleaned up from: {temp_dir}")
+		
+	finally:
+		# Clean up temporary files
+		if temp_dir.exists():
+			shutil.rmtree(temp_dir)
 
 	# Optionally save mapping
 	if return_mapping_csv:
